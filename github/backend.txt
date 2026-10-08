@@ -1,0 +1,264 @@
+import calendar
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta
+
+# these expense categories repeat every month on the same day
+MONTHLY = ["rent", "utilities", "salaries", "salary"]
+# this one repeats every week
+WEEKLY = ["inventory"]
+DEFAULT_THRESHOLD = 50000
+
+
+def inr(n):
+    # indian style commas: 4800000 -> 48,00,000
+    n = int(round(n))
+    sign = "-" if n < 0 else ""
+    s = str(abs(n))
+    if len(s) <= 3:
+        return sign + s
+    last3 = s[-3:]
+    rest = s[:-3]
+    groups = []
+    while len(rest) > 2:
+        groups.insert(0, rest[-2:])
+        rest = rest[:-2]
+    if rest:
+        groups.insert(0, rest)
+    return sign + ",".join(groups + [last3])
+
+
+def parse_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def to_float(value):
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def clean_transactions(raw):
+    # drop rows we can't use (bad date, bad type, bad amount)
+    result = []
+    for r in raw or []:
+        d = parse_date(r.get("date"))
+        kind = str(r.get("type", "")).strip().lower()
+        amount = to_float(r.get("amount"))
+        if d is None or amount is None or kind not in ("income", "expense"):
+            continue
+        category = str(r.get("category") or "Other").strip() or "Other"
+        result.append({"date": d, "type": kind, "amount": abs(amount), "category": category})
+    return result
+
+
+def clean_invoices(raw):
+    result = []
+    for r in raw or []:
+        amount = to_float(r.get("amount"))
+        if amount is None:
+            continue
+        paid = parse_date(r.get("paid_date")) if r.get("paid_date") else None
+        result.append({
+            "customer": str(r.get("customer") or "Unknown").strip(),
+            "due_date": parse_date(r.get("due_date")),
+            "paid_date": paid,
+            "amount": abs(amount),
+            "status": str(r.get("status") or "").strip().lower(),
+        })
+    return result
+
+
+def is_unpaid(inv):
+    return inv["status"] != "paid" and inv["paid_date"] is None
+
+
+def last_data_date(txns):
+    # the forecast starts the day after the newest transaction
+    if not txns:
+        return date.today()
+    return max(t["date"] for t in txns)
+
+
+def current_balance(business, txns):
+    balance = to_float((business or {}).get("opening_balance")) or 0
+    for t in txns:
+        if t["type"] == "income":
+            balance += t["amount"]
+        else:
+            balance -= t["amount"]
+    return balance
+
+
+def average_delays(invoices):
+    # how many days late each customer usually pays (paid_date - due_date)
+    delays = defaultdict(list)
+    for inv in invoices:
+        if inv["paid_date"] and inv["due_date"]:
+            delays[inv["customer"]].append((inv["paid_date"] - inv["due_date"]).days)
+    per_customer = {name: sum(v) / len(v) for name, v in delays.items()}
+    everyone = [x for v in delays.values() for x in v]
+    overall = sum(everyone) / len(everyone) if everyone else 0
+    return per_customer, overall
+
+
+def get_threshold(business, threshold):
+    if threshold is not None:
+        return float(threshold)
+    saved = to_float((business or {}).get("low_cash_threshold"))
+    return saved if saved is not None else DEFAULT_THRESHOLD
+
+
+def run_forecast(transactions, invoices, business, days=60, sales_change_pct=0,
+                 expense_change_pct=0, delay_days=0, threshold=None):
+    days = max(1, min(int(days), 365))
+    txns = clean_transactions(transactions)
+    invs = clean_invoices(invoices)
+    business = business or {}
+
+    as_of = last_data_date(txns)
+    start = as_of + timedelta(days=1)
+    end = as_of + timedelta(days=days)
+    start_balance = current_balance(business, txns)
+    limit = get_threshold(business, threshold)
+
+    first_date = min((t["date"] for t in txns), default=as_of)
+    history_days = (as_of - first_date).days + 1
+
+    # --- sales: average for each weekday over the last 8 weeks ---
+    weeks = max(1, min(8, history_days // 7))
+    week_start = as_of - timedelta(days=weeks * 7 - 1)
+    sales = [t for t in txns if t["type"] == "income" and t["category"].lower() == "sales"]
+    if not sales:
+        sales = [t for t in txns if t["type"] == "income"]
+    weekday_totals = defaultdict(float)
+    for t in sales:
+        if t["date"] >= week_start:
+            weekday_totals[t["date"].weekday()] += t["amount"]
+    sales_per_weekday = {wd: total / weeks for wd, total in weekday_totals.items()}
+
+    expenses = [t for t in txns if t["type"] == "expense"]
+
+    # --- rent, utilities, salaries: same day every month ---
+    by_month = defaultdict(dict)  # category -> {(year, month): [total, day]}
+    for t in expenses:
+        if t["category"].lower() in MONTHLY:
+            key = (t["date"].year, t["date"].month)
+            entry = by_month[t["category"]].setdefault(key, [0, t["date"].day])
+            entry[0] += t["amount"]
+            entry[1] = max(entry[1], t["date"].day)
+
+    monthly_bills = defaultdict(float)
+    for cat, months in by_month.items():
+        keys = sorted(months)[-3:]
+        avg = sum(months[k][0] for k in keys) / len(keys)
+        pay_day = months[sorted(months)[-1]][1]
+        y, m = start.year, start.month
+        while (y, m) <= (end.year, end.month):
+            # skip if this month's bill is already in the data
+            if (y, m) not in months:
+                day = min(pay_day, calendar.monthrange(y, m)[1])
+                d = date(y, m, day)
+                if start <= d <= end:
+                    monthly_bills[d] += avg
+            m += 1
+            if m > 12:
+                y += 1
+                m = 1
+
+    # --- inventory: once a week on its usual weekday ---
+    weekly_bills = defaultdict(float)
+    for cat in set(t["category"] for t in expenses if t["category"].lower() in WEEKLY):
+        rows = [t for t in expenses if t["category"] == cat and t["date"] >= week_start]
+        if not rows:
+            continue
+        per_week = sum(t["amount"] for t in rows) / weeks
+        usual_day = Counter(t["date"].weekday() for t in rows).most_common(1)[0][0]
+        d = start
+        while d <= end:
+            if d.weekday() == usual_day:
+                weekly_bills[d] += per_week
+            d += timedelta(days=1)
+
+    # --- marketing and anything else: daily average of the last 90 days ---
+    n90 = max(1, min(90, history_days))
+    start90 = as_of - timedelta(days=n90 - 1)
+    other_total = 0
+    for t in expenses:
+        cat = t["category"].lower()
+        if t["date"] >= start90 and cat not in MONTHLY and cat not in WEEKLY:
+            other_total += t["amount"]
+    daily_other = other_total / n90
+
+    # --- unpaid invoices: due date + how late this customer usually pays ---
+    per_customer, overall = average_delays(invs)
+    invoice_money = defaultdict(float)
+    for inv in invs:
+        if not is_unpaid(inv) or inv["due_date"] is None:
+            continue
+        late_by = per_customer.get(inv["customer"], overall)
+        expected = inv["due_date"] + timedelta(days=int(round(late_by)) + int(delay_days))
+        if expected < start:
+            expected = start
+        if expected <= end:
+            invoice_money[expected] += inv["amount"]
+
+    # --- put it together day by day ---
+    sales_x = 1 + float(sales_change_pct) / 100
+    expense_x = 1 + float(expense_change_pct) / 100
+    rows = []
+    balance = start_balance
+    for i in range(days):
+        d = start + timedelta(days=i)
+        income = sales_per_weekday.get(d.weekday(), 0) * sales_x + invoice_money.get(d, 0)
+        spend = (monthly_bills.get(d, 0) + weekly_bills.get(d, 0) + daily_other) * expense_x
+        balance += income - spend
+        rows.append({
+            "date": d.isoformat(),
+            "income": round(income, 2),
+            "expense": round(spend, 2),
+            "balance": round(balance, 2),
+        })
+
+    lowest = min(rows, key=lambda r: r["balance"])
+    return {
+        "as_of": as_of.isoformat(),
+        "days_forecast": days,
+        "start_balance": round(start_balance, 2),
+        "threshold": limit,
+        "days": rows,
+        "lowest_balance": lowest["balance"],
+        "lowest_date": lowest["date"],
+        "alerts": find_alerts(rows, start_balance, as_of, limit),
+        "scenario": {
+            "sales_change_pct": float(sales_change_pct),
+            "expense_change_pct": float(expense_change_pct),
+            "delay_days": int(delay_days),
+        },
+    }
+
+
+def find_alerts(rows, start_balance, as_of, limit):
+    if start_balance < limit:
+        return [{
+            "date": as_of.isoformat(),
+            "balance": round(start_balance, 2),
+            "threshold": limit,
+            "message": f"Cash is already below \u20b9{inr(limit)} (balance \u20b9{inr(start_balance)})",
+        }]
+    for r in rows:
+        if r["balance"] < limit:
+            return [{
+                "date": r["date"],
+                "balance": r["balance"],
+                "threshold": limit,
+                "message": f"Cash may fall below \u20b9{inr(limit)} on {r['date']}",
+            }]
+    return []
